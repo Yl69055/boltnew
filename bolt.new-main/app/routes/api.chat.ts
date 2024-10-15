@@ -1,8 +1,10 @@
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
-import { MAX_RESPONSE_SEGMENTS, MAX_TOKENS } from '~/lib/.server/llm/constants';
-import { CONTINUE_PROMPT } from '~/lib/.server/llm/prompts';
 import { streamText, type Messages, type StreamingOptions } from '~/lib/.server/llm/stream-text';
 import SwitchableStream from '~/lib/.server/llm/switchable-stream';
+
+const MAX_TOKENS = 2048;
+const MAX_RESPONSE_SEGMENTS = 5;
+const CONTINUE_PROMPT = "Please continue from where you left off.";
 
 export async function action(args: ActionFunctionArgs) {
   return chatAction(args);
@@ -15,45 +17,47 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
 
   try {
     const options: StreamingOptions = {
-      toolChoice: 'none',
-      onFinish: async ({ text: content, finishReason }) => {
-        if (finishReason !== 'length') {
-          return stream.close();
-        }
-
-        if (stream.switches >= MAX_RESPONSE_SEGMENTS) {
-          throw Error('Cannot continue message: Maximum segments reached');
-        }
-
-        const switchesLeft = MAX_RESPONSE_SEGMENTS - stream.switches;
-
-        console.log(`Reached max token limit (${MAX_TOKENS}): Continuing message (${switchesLeft} switches left)`);
-
-        messages.push({ role: 'assistant', content });
-        messages.push({ role: 'user', content: CONTINUE_PROMPT });
-
-        const result = await streamText(messages, context.cloudflare.env, options);
-
-        return stream.switchSource(result.toAIStream());
-      },
+      maxTokens: MAX_TOKENS,
+      temperature: 0.7,
     };
 
-    const result = await streamText(messages, context.cloudflare.env, options);
+    const encoder = new TextEncoder();
 
-    stream.switchSource(result.toAIStream());
+    async function* generateStream(messages: Messages) {
+      for await (const chunk of streamText(messages, context.cloudflare.env, options)) {
+        yield encoder.encode(chunk);
+      }
+    }
 
-    return new Response(stream.readable, {
+    const responseStream = new ReadableStream({
+      async start(controller) {
+        try {
+          for await (const chunk of generateStream(messages)) {
+            controller.enqueue(chunk);
+          }
+        } catch (error) {
+          console.error('Stream error:', error);
+          controller.error(error);
+        } finally {
+          controller.close();
+        }
+      }
+    });
+
+    return new Response(responseStream, {
       status: 200,
       headers: {
-        contentType: 'text/plain; charset=utf-8',
+        'Content-Type': 'text/plain; charset=utf-8',
       },
     });
   } catch (error) {
-    console.log(error);
+    console.error('Chat action error:', error);
 
-    throw new Response(null, {
+    return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
       status: 500,
-      statusText: 'Internal Server Error',
+      headers: {
+        'Content-Type': 'application/json',
+      },
     });
   }
 }

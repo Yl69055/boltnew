@@ -1,5 +1,5 @@
 interface Env {
-  ANTHROPIC_API_KEY: string;
-  ANTHROPIC_BASE_URL: string;
-  ANTHROPIC_MODEL: string;
+  OPENAI_API_KEY: string;
+  OPENAI_API_BASE_URL: string;
+  OPENAI_API_MODEL: string;
 }
