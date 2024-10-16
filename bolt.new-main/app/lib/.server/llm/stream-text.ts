@@ -1,4 +1,4 @@
-import { getClaudeModel, getModel } from '~/lib/.server/llm/model';
+import { getClaudeModel } from '~/lib/.server/llm/model';
 import { MAX_TOKENS } from './constants';
 import { getSystemPrompt } from './prompts';
 

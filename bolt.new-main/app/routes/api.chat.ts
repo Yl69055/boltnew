@@ -9,16 +9,29 @@ export async function action(args: ActionFunctionArgs) {
 }
 
 async function chatAction({ context, request }: ActionFunctionArgs) {
-  const { messages } = await request.json<{ messages: Messages }>();
+  console.log('Received chat action request');
 
-  const stream = new SwitchableStream();
+  // 添加 CORS 头
+  const headers = new Headers({
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  });
+
+  // 处理 OPTIONS 请求
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { headers });
+  }
 
   try {
+    const { messages } = await request.json<{ messages: Messages }>();
+    console.log('Received messages:', JSON.stringify(messages));
+
+    const stream = new SwitchableStream();
+
     const options: StreamingOptions = {
-      maxTokens: MAX_TOKENS,
-      temperature: 0.7,
-      onFinish: async (result: { text: string; finishReason: string }) => {
-        if (result.finishReason !== 'length') {
+      onFinish: async ({ text: content, finishReason }) => {
+        if (finishReason !== 'length') {
           return stream.close();
         }
 
@@ -33,9 +46,9 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
         messages.push({ role: 'assistant', content });
         messages.push({ role: 'user', content: CONTINUE_PROMPT });
 
-        const newResult = await streamText(messages, context.cloudflare.env, options);
+        const result = await streamText(messages, context.cloudflare.env, options);
 
-        return stream.switchSource(newResult);
+        return stream.switchSource(result);
       },
     };
 
@@ -43,18 +56,17 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
 
     stream.switchSource(result);
 
-    return new Response(stream.readable, {
-      status: 200,
-      headers: {
-        'Content-Type': 'text/plain; charset=utf-8',
-      },
-    });
-  } catch (error) {
-    console.error(error);
+    headers.set('Content-Type', 'text/plain; charset=utf-8');
 
-    throw new Response(null, {
-      status: 500,
-      statusText: 'Internal Server Error',
-    });
+    return new Response(stream.readable, { status: 200, headers });
+  } catch (error) {
+    console.error('Error in chatAction:', error);
+
+    headers.set('Content-Type', 'application/json');
+
+    return new Response(
+      JSON.stringify({ error: 'An error occurred while processing your request' }),
+      { status: 500, headers }
+    );
   }
 }

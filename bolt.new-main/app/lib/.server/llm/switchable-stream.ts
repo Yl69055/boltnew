@@ -2,6 +2,8 @@ export default class SwitchableStream extends TransformStream {
   private _controller: TransformStreamDefaultController | null = null;
   private _currentReader: ReadableStreamDefaultReader | null = null;
   private _switches = 0;
+  private _isClosed = false;
+  private _isReading = false;
 
   constructor() {
     let controllerRef: TransformStreamDefaultController | undefined;
@@ -20,44 +22,91 @@ export default class SwitchableStream extends TransformStream {
   }
 
   async switchSource(newStream: ReadableStream) {
-    if (this._currentReader) {
-      await this._currentReader.cancel();
+    if (this._isClosed) {
+      console.warn('Attempt to switch source on closed stream');
+      return;
     }
 
-    this._currentReader = newStream.getReader();
+    // 等待当前的读取操作完成
+    while (this._isReading) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
 
-    this._pumpStream();
+    if (this._currentReader) {
+      try {
+        await this._currentReader.cancel();
+      } catch (error) {
+        console.warn('Error cancelling previous reader:', error);
+      }
+    }
+
+    try {
+      this._currentReader = newStream.getReader();
+      await this._pumpStream();
+    } catch (error) {
+      console.error('Error in switchSource:', error);
+      if (!this._isClosed && this._controller) {
+        this._controller.error(error);
+      }
+    }
 
     this._switches++;
   }
 
   private async _pumpStream() {
-    if (!this._currentReader || !this._controller) {
-      throw new Error('Stream is not properly initialized');
+    if (!this._currentReader || !this._controller || this._isClosed) {
+      console.warn('Stream is not properly initialized or is closed');
+      return;
     }
 
+    this._isReading = true;
+
     try {
-      while (true) {
+      while (!this._isClosed) {
         const { done, value } = await this._currentReader.read();
 
         if (done) {
           break;
         }
 
-        this._controller.enqueue(value);
+        if (this._controller && !this._isClosed) {
+          this._controller.enqueue(value);
+        } else {
+          break;
+        }
       }
     } catch (error) {
-      console.log(error);
-      this._controller.error(error);
+      console.error('Error in _pumpStream:', error);
+      if (!this._isClosed && this._controller) {
+        this._controller.error(error);
+      }
+    } finally {
+      this._isReading = false;
     }
   }
 
   close() {
-    if (this._currentReader) {
-      this._currentReader.cancel();
+    if (this._isClosed) {
+      return;
     }
 
-    this._controller?.terminate();
+    this._isClosed = true;
+
+    if (this._currentReader) {
+      try {
+        this._currentReader.cancel();
+      } catch (error) {
+        console.warn('Error cancelling reader during close:', error);
+      }
+    }
+
+    if (this._controller) {
+      try {
+        this._controller.terminate();
+      } catch (error) {
+        console.warn('Error terminating controller during close:', error);
+      }
+    }
   }
 
   get switches() {
