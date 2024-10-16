@@ -37,9 +37,6 @@ export function Chat() {
           );
         }}
         icon={({ type }) => {
-          /**
-           * @todo Handle more types if we need them. This may require extra color palettes.
-           */
           switch (type) {
             case 'success': {
               return <div className="i-ph:check-bold text-bolt-elements-icon-success text-2xl" />;
@@ -75,15 +72,38 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
 
   const [animationScope, animate] = useAnimate();
 
-  const { messages, isLoading, input, handleInputChange, setInput, stop, append } = useChat({
+  const [lastReceivedMessage, setLastReceivedMessage] = useState<string>('');
+
+  const { messages, isLoading, input, handleInputChange, setInput, stop, append, setMessages } = useChat({
     api: '/api/chat',
     onError: (error) => {
-      logger.error('Request failed\n\n', error);
-      toast.error('There was an error processing your request');
+      logger.error('Chat request failed:', error);
+      if (error instanceof Error) {
+        toast.error(`Error: ${error.message}`);
+      } else {
+        toast.error('There was an error processing your request');
+      }
     },
     onFinish: () => {
       logger.debug('Finished streaming');
+      if (lastReceivedMessage) {
+        setMessages(prevMessages => [
+          ...prevMessages.slice(0, -1),
+          { 
+            id: `assistant-${Date.now()}`,
+            role: 'assistant', 
+            content: lastReceivedMessage 
+          } as Message
+        ]);
+        setLastReceivedMessage('');
+      }
     },
+    onResponse: (response) => {
+      if (!response.ok) {
+        logger.error(`Response not OK. Status: ${response.status}`);
+      }
+    },
+    experimental_onFunctionCall: () => Promise.resolve(undefined),
     initialMessages,
   });
 
@@ -100,7 +120,10 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
     parseMessages(messages, isLoading);
 
     if (messages.length > initialMessages.length) {
-      storeMessageHistory(messages).catch((error) => toast.error(error.message));
+      storeMessageHistory(messages).catch((error) => {
+        logger.error('Failed to store message history:', error);
+        toast.error('Failed to save chat history');
+      });
     }
   }, [messages, isLoading, parseMessages]);
 
@@ -153,47 +176,30 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
       return;
     }
 
-    /**
-     * @note (delm) Usually saving files shouldn't take long but it may take longer if there
-     * many unsaved files. In that case we need to block user input and show an indicator
-     * of some kind so the user is aware that something is happening. But I consider the
-     * happy case to be no unsaved files and I would expect users to save their changes
-     * before they send another message.
-     */
-    await workbenchStore.saveAllFiles();
+    try {
+      await workbenchStore.saveAllFiles();
 
-    const fileModifications = workbenchStore.getFileModifcations();
+      const fileModifications = workbenchStore.getFileModifcations();
 
-    chatStore.setKey('aborted', false);
+      chatStore.setKey('aborted', false);
 
-    runAnimation();
+      runAnimation();
 
-    if (fileModifications !== undefined) {
-      const diff = fileModificationsToHTML(fileModifications);
+      if (fileModifications !== undefined) {
+        const diff = fileModificationsToHTML(fileModifications);
+        append({ role: 'user', content: `${diff}\n\n${_input}` });
+        workbenchStore.resetAllFileModifications();
+      } else {
+        append({ role: 'user', content: _input });
+      }
 
-      /**
-       * If we have file modifications we append a new user message manually since we have to prefix
-       * the user input with the file modifications and we don't want the new user input to appear
-       * in the prompt. Using `append` is almost the same as `handleSubmit` except that we have to
-       * manually reset the input and we'd have to manually pass in file attachments. However, those
-       * aren't relevant here.
-       */
-      append({ role: 'user', content: `${diff}\n\n${_input}` });
-
-      /**
-       * After sending a new message we reset all modifications since the model
-       * should now be aware of all the changes.
-       */
-      workbenchStore.resetAllFileModifications();
-    } else {
-      append({ role: 'user', content: _input });
+      setInput('');
+      resetEnhancer();
+      textareaRef.current?.blur();
+    } catch (error) {
+      logger.error('Error sending message:', error);
+      toast.error('Failed to send message. Please try again.');
     }
-
-    setInput('');
-
-    resetEnhancer();
-
-    textareaRef.current?.blur();
   };
 
   const [messageRef, scrollRef] = useSnapScroll();

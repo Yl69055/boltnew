@@ -1,6 +1,14 @@
 import { getAPIKey } from '~/lib/.server/llm/api-key';
 import { env } from 'node:process';
 
+interface ChatCompletionResponse {
+  choices: {
+    message: {
+      content: string;
+    };
+  }[];
+}
+
 // Custom API client for Claude API
 class ClaudeAPI {
   private apiKey: string;
@@ -11,32 +19,62 @@ class ClaudeAPI {
     this.baseURL = baseURL;
   }
 
-  async createChatCompletion(messages: any[]) {
-    const response = await fetch(`${this.baseURL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.apiKey}`
-      },
-      body: JSON.stringify({
-        model: getModel(env as unknown as Env),
-        messages: messages
-      })
-    });
+  async createChatCompletion(messages: any[]): Promise<ChatCompletionResponse> {
+    const maxRetries = 5; // 增加重试次数
+    let retries = 0;
 
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
+    while (retries < maxRetries) {
+      try {
+        console.log(`尝试API请求，重试次数: ${retries}`);
+        const response = await fetch(`${this.baseURL}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${this.apiKey}`
+          },
+          body: JSON.stringify({
+            model: getModel(env as unknown as Env),
+            messages: messages
+          })
+        });
+
+        if (!response.ok) {
+          console.error(`API请求失败，状态码: ${response.status}`);
+          if (response.status === 503 || response.status === 500) {
+            console.error(`服务器错误 (${response.status})，尝试重试 ${retries + 1}/${maxRetries}`);
+            retries++;
+            await new Promise(resolve => setTimeout(resolve, 2000 * retries)); // 增加等待时间
+            continue;
+          }
+          throw new Error(`HTTP错误！状态码: ${response.status}`);
+        }
+
+        const responseData = await response.json() as ChatCompletionResponse;
+        console.log('API请求成功，收到响应');
+        return responseData;
+      } catch (error) {
+        console.error('API请求出错:', error);
+        if (retries === maxRetries - 1) {
+          throw error;
+        }
+        retries++;
+        await new Promise(resolve => setTimeout(resolve, 2000 * retries));
+      }
     }
 
-    return response.json();
+    throw new Error('超过最大重试次数');
   }
 }
 
 export function getClaudeModel(env: Env) {
-  return new ClaudeAPI(
-    getAPIKey(env),
-    getBaseUrl(env)
-  );
+  const apiKey = getAPIKey(env);
+  const baseUrl = getBaseUrl(env);
+
+  if (!apiKey || !baseUrl) {
+    throw new Error('API密钥或基础URL未正确配置');
+  }
+
+  return new ClaudeAPI(apiKey, baseUrl);
 }
 
 export function getBaseUrl(cloudflareEnv: Env) {
