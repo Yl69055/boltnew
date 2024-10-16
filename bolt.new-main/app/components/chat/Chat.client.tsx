@@ -83,6 +83,8 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
       } else {
         toast.error('There was an error processing your request');
       }
+      // 添加重试逻辑
+      retryRequest();
     },
     onFinish: () => {
       logger.debug('Finished streaming');
@@ -101,11 +103,23 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
     onResponse: (response) => {
       if (!response.ok) {
         logger.error(`Response not OK. Status: ${response.status}`);
+        if (response.status >= 500) {
+          // 服务器错误，尝试重试
+          retryRequest();
+        }
       }
     },
     experimental_onFunctionCall: () => Promise.resolve(undefined),
     initialMessages,
   });
+
+  const retryRequest = () => {
+    // 实现重试逻辑
+    setTimeout(() => {
+      logger.info('Retrying request...');
+      handleSendMessage(input);
+    }, 5000); // 5秒后重试
+  };
 
   const { enhancingPrompt, promptEnhanced, enhancePrompt, resetEnhancer } = usePromptEnhancer();
   const { parsedMessages, parseMessages } = useMessageParser();
@@ -169,10 +183,8 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
     setChatStarted(true);
   };
 
-  const sendMessage = async (_event: React.UIEvent, messageInput?: string) => {
-    const _input = messageInput || input;
-
-    if (_input.length === 0 || isLoading) {
+  const handleSendMessage = async (messageInput: string) => {
+    if (messageInput.length === 0 || isLoading) {
       return;
     }
 
@@ -187,10 +199,10 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
 
       if (fileModifications !== undefined) {
         const diff = fileModificationsToHTML(fileModifications);
-        append({ role: 'user', content: `${diff}\n\n${_input}` });
+        append({ role: 'user', content: `${diff}\n\n${messageInput}` });
         workbenchStore.resetAllFileModifications();
       } else {
-        append({ role: 'user', content: _input });
+        append({ role: 'user', content: messageInput });
       }
 
       setInput('');
@@ -200,6 +212,10 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
       logger.error('Error sending message:', error);
       toast.error('Failed to send message. Please try again.');
     }
+  };
+
+  const sendMessage = (event: React.UIEvent<Element, UIEvent>, messageInput?: string) => {
+    handleSendMessage(messageInput || input);
   };
 
   const [messageRef, scrollRef] = useSnapScroll();
