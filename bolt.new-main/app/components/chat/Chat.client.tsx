@@ -13,12 +13,24 @@ import { cubicEasingFn } from '~/utils/easings';
 import { createScopedLogger, renderLogger } from '~/utils/logger';
 import { BaseChat } from './BaseChat';
 
+// 导入 WebContainer
+import { WebContainer } from '@webcontainer/api';
+
 const toastAnimation = cssTransition({
   enter: 'animated fadeInRight',
   exit: 'animated fadeOutRight',
 });
 
 const logger = createScopedLogger('Chat');
+
+// 新增 WebContainerPreview 组件，并添加类型定义
+const WebContainerPreview: React.FC<{ url: string }> = ({ url }) => {
+  return (
+    <div style={{ width: '100%', height: '400px', border: '1px solid #ccc', marginTop: '20px' }}>
+      <iframe src={url} style={{ width: '100%', height: '100%', border: 'none' }} />
+    </div>
+  );
+};
 
 export function Chat() {
   renderLogger.trace('Chat');
@@ -65,6 +77,8 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
   useShortcuts();
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [webContainerInstance, setWebContainerInstance] = useState<WebContainer | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
   const [chatStarted, setChatStarted] = useState(initialMessages.length > 0);
 
@@ -72,54 +86,24 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
 
   const [animationScope, animate] = useAnimate();
 
-  const [lastReceivedMessage, setLastReceivedMessage] = useState<string>('');
-
-  const { messages, isLoading, input, handleInputChange, setInput, stop, append, setMessages } = useChat({
+  const { messages, isLoading, input, handleInputChange, setInput, stop, append } = useChat({
     api: '/api/chat',
     onError: (error) => {
       logger.error('Chat request failed:', error);
-      if (error instanceof Error) {
-        toast.error(`Error: ${error.message}`);
-      } else {
-        toast.error('There was an error processing your request');
-      }
-      // 添加重试逻辑
-      retryRequest();
+      toast.error('There was an error processing your request');
     },
     onFinish: () => {
       logger.debug('Finished streaming');
-      if (lastReceivedMessage) {
-        setMessages(prevMessages => [
-          ...prevMessages.slice(0, -1),
-          { 
-            id: `assistant-${Date.now()}`,
-            role: 'assistant', 
-            content: lastReceivedMessage 
-          } as Message
-        ]);
-        setLastReceivedMessage('');
+      const lastMessage = messages[messages.length - 1];
+      if (lastMessage && lastMessage.role === 'assistant') {
+        handleBoltActions(lastMessage.content).catch((error) => {
+          logger.error('Error handling bolt actions:', error);
+          toast.error('Error processing AI response. Please try again.');
+        });
       }
     },
-    onResponse: (response) => {
-      if (!response.ok) {
-        logger.error(`Response not OK. Status: ${response.status}`);
-        if (response.status >= 500) {
-          // 服务器错误，尝试重试
-          retryRequest();
-        }
-      }
-    },
-    experimental_onFunctionCall: () => Promise.resolve(undefined),
     initialMessages,
   });
-
-  const retryRequest = () => {
-    // 实现重试逻辑
-    setTimeout(() => {
-      logger.info('Retrying request...');
-      handleSendMessage(input);
-    }, 5000); // 5秒后重试
-  };
 
   const { enhancingPrompt, promptEnhanced, enhancePrompt, resetEnhancer } = usePromptEnhancer();
   const { parsedMessages, parseMessages } = useMessageParser();
@@ -134,12 +118,89 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
     parseMessages(messages, isLoading);
 
     if (messages.length > initialMessages.length) {
-      storeMessageHistory(messages).catch((error) => {
-        logger.error('Failed to store message history:', error);
-        toast.error('Failed to save chat history');
-      });
+      storeMessageHistory(messages).catch((error) => toast.error(error.message));
     }
   }, [messages, isLoading, parseMessages]);
+
+  // 初始化 WebContainer
+  useEffect(() => {
+    const initWebContainer = async () => {
+      if (!webContainerInstance) {
+        try {
+          logger.debug('Initializing WebContainer...');
+          const instance = await WebContainer.boot();
+          setWebContainerInstance(instance);
+          logger.debug('WebContainer initialized successfully');
+        } catch (error) {
+          logger.error('Failed to initialize WebContainer:', error);
+          toast.error('Failed to initialize WebContainer. Please try again.');
+        }
+      }
+    };
+
+    initWebContainer();
+  }, []);
+
+  // 处理 boltArtifact 和 boltAction
+  const handleBoltActions = async (content: string) => {
+    if (!webContainerInstance) {
+      logger.error('WebContainer not initialized');
+      toast.error('WebContainer not initialized. Please try again.');
+      return;
+    }
+
+    try {
+      logger.debug('Parsing boltArtifact content...');
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(content, 'text/html');
+      const boltArtifact = doc.querySelector('boltArtifact');
+
+      if (boltArtifact) {
+        logger.debug('Found boltArtifact, processing actions...');
+        const actions = boltArtifact.querySelectorAll('boltAction');
+        for (const action of actions) {
+          const type = action.getAttribute('type');
+          const filePath = action.getAttribute('filePath');
+          const actionContent = action.textContent;
+
+          if (type === 'file' && filePath && actionContent) {
+            logger.debug(`Writing file: ${filePath}`);
+            await webContainerInstance.fs.writeFile(filePath, actionContent);
+          } else if (type === 'shell' && actionContent) {
+            logger.debug(`Executing shell command: ${actionContent}`);
+            const process = await webContainerInstance.spawn('sh', ['-c', actionContent]);
+            process.output.pipeTo(new WritableStream({
+              write(data) {
+                logger.debug(`Shell output: ${data}`);
+              }
+            }));
+            await process.exit;
+          }
+        }
+
+        // 运行开发服务器
+        logger.debug('Starting development server...');
+        const serverProcess = await webContainerInstance.spawn('npm', ['run', 'dev']);
+        serverProcess.output.pipeTo(new WritableStream({
+          write(data) {
+            logger.debug(`Server output: ${data}`);
+            // 检查输出中是否包含本地服务器的 URL
+            const match = data.match(/Local:\s+(http:\/\/localhost:\d+)/);
+            if (match) {
+              const url = match[1];
+              logger.debug(`Setting preview URL: ${url}`);
+              setPreviewUrl(url);
+            }
+          }
+        }));
+      } else {
+        logger.warn('No boltArtifact found in the message');
+      }
+    } catch (error) {
+      logger.error('Error processing boltActions:', error);
+      toast.error('Error processing actions. Please try again.');
+    }
+  };
 
   const scrollTextArea = () => {
     const textarea = textareaRef.current;
@@ -183,74 +244,72 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
     setChatStarted(true);
   };
 
-  const handleSendMessage = async (messageInput: string) => {
-    if (messageInput.length === 0 || isLoading) {
+  const sendMessage = async (_event: React.UIEvent, messageInput?: string) => {
+    const _input = messageInput || input;
+
+    if (_input.length === 0 || isLoading) {
       return;
     }
 
-    try {
-      await workbenchStore.saveAllFiles();
+    await workbenchStore.saveAllFiles();
 
-      const fileModifications = workbenchStore.getFileModifcations();
+    const fileModifications = workbenchStore.getFileModifcations();
 
-      chatStore.setKey('aborted', false);
+    chatStore.setKey('aborted', false);
 
-      runAnimation();
+    runAnimation();
 
-      if (fileModifications !== undefined) {
-        const diff = fileModificationsToHTML(fileModifications);
-        append({ role: 'user', content: `${diff}\n\n${messageInput}` });
-        workbenchStore.resetAllFileModifications();
-      } else {
-        append({ role: 'user', content: messageInput });
-      }
-
-      setInput('');
-      resetEnhancer();
-      textareaRef.current?.blur();
-    } catch (error) {
-      logger.error('Error sending message:', error);
-      toast.error('Failed to send message. Please try again.');
+    if (fileModifications !== undefined) {
+      const diff = fileModificationsToHTML(fileModifications);
+      append({ role: 'user', content: `${diff}\n\n${_input}` });
+      workbenchStore.resetAllFileModifications();
+    } else {
+      append({ role: 'user', content: _input });
     }
-  };
 
-  const sendMessage = (event: React.UIEvent<Element, UIEvent>, messageInput?: string) => {
-    handleSendMessage(messageInput || input);
+    setInput('');
+
+    resetEnhancer();
+
+    textareaRef.current?.blur();
   };
 
   const [messageRef, scrollRef] = useSnapScroll();
 
   return (
-    <BaseChat
-      ref={animationScope}
-      textareaRef={textareaRef}
-      input={input}
-      showChat={showChat}
-      chatStarted={chatStarted}
-      isStreaming={isLoading}
-      enhancingPrompt={enhancingPrompt}
-      promptEnhanced={promptEnhanced}
-      sendMessage={sendMessage}
-      messageRef={messageRef}
-      scrollRef={scrollRef}
-      handleInputChange={handleInputChange}
-      handleStop={abort}
-      messages={messages.map((message, i) => {
-        if (message.role === 'user') {
-          return message;
-        }
+    <>
+      <BaseChat
+        ref={animationScope}
+        textareaRef={textareaRef}
+        input={input}
+        showChat={showChat}
+        chatStarted={chatStarted}
+        isStreaming={isLoading}
+        enhancingPrompt={enhancingPrompt}
+        promptEnhanced={promptEnhanced}
+        sendMessage={sendMessage}
+        messageRef={messageRef}
+        scrollRef={scrollRef}
+        handleInputChange={handleInputChange}
+        handleStop={abort}
+        messages={messages.map((message, i) => {
+          if (message.role === 'user') {
+            return message;
+          }
 
-        return {
-          ...message,
-          content: parsedMessages[i] || '',
-        };
-      })}
-      enhancePrompt={() => {
-        enhancePrompt(input, (input) => {
-          setInput(input);
-          scrollTextArea();
-        });
-      }}
-    />
+          return {
+            ...message,
+            content: parsedMessages[i] || '',
+          };
+        })}
+        enhancePrompt={() => {
+          enhancePrompt(input, (input) => {
+            setInput(input);
+            scrollTextArea();
+          });
+        }}
+      />
+      {previewUrl && <WebContainerPreview url={previewUrl} />}
+    </>
   );
 });
